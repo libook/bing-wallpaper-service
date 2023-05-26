@@ -5,11 +5,32 @@ use serde_derive::{Deserialize, Serialize};
 use serde_json;
 use serde_qs as qs;
 use std::convert::Infallible;
+use bytes::Bytes;
 
 static BING_DOMAIN: &str = "https://www.bing.com";
 static BING_API_PATH: &str = "/HPImageArchive.aspx";
 // static BING_API_QUERYSTRING: &str = "format=js&idx=0&n=1&mkt=en-US";
 static LISTEN_ADDRESS: &str = "127.0.0.1:3000";
+
+#[derive(Debug, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+struct RequestQueryParams {
+    index_past: usize,
+    number: usize,
+    locale: String,
+    get_image: bool,
+}
+
+impl Default for RequestQueryParams {
+    fn default() -> Self {
+        RequestQueryParams {
+            index_past: 0,
+            number: 1,
+            locale: "en-US".to_string(),
+            get_image: false,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
@@ -31,17 +52,7 @@ impl Default for BingQueryParams {
     }
 }
 
-async fn request_bing(received_query: BingQueryParams) -> Result<serde_json::Value, Infallible> {
-    let mut bing_query = BingQueryParams {
-        ..Default::default()
-    };
-
-    {
-        bing_query.idx = received_query.idx;
-        bing_query.n = received_query.n;
-        bing_query.mkt = received_query.mkt;
-    }
-
+async fn request_bing(bing_query: BingQueryParams) -> Result<serde_json::Value, Infallible> {
     let res_raw = reqwest::get(format!(
         "{}{}?{}",
         BING_DOMAIN,
@@ -54,11 +65,31 @@ async fn request_bing(received_query: BingQueryParams) -> Result<serde_json::Val
     Ok(res)
 }
 
-async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
-    let received_querystring: &str = req.uri().query().unwrap_or("");
-    let received_query: BingQueryParams = qs::from_str(received_querystring).unwrap();
+async fn fetch_image(url: String) -> Result<Bytes, Infallible> {
+    let response = reqwest::get(url).await.unwrap();
+    let bytes = response.bytes().await.unwrap();
+    Ok(bytes)
+}
 
-    let res = request_bing(received_query).await.unwrap();
+async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+    // Processing request arguments
+
+    let received_querystring: &str = req.uri().query().unwrap_or("");
+    let received_query: RequestQueryParams = qs::from_str(received_querystring).unwrap();
+
+    let mut bing_query = BingQueryParams {
+        ..Default::default()
+    };
+
+    {
+        bing_query.idx = received_query.index_past;
+        bing_query.n = received_query.number;
+        bing_query.mkt = received_query.locale;
+    }
+
+    // Get image URL
+
+    let res = request_bing(bing_query).await.unwrap();
 
     let url = format!(
         "{}{}",
@@ -66,9 +97,20 @@ async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
         res["images"][0]["url"].as_str().unwrap().to_owned()
     );
 
-    let response = Response::new(Body::from(url));
+    if received_query.get_image {
+        // Get image data
 
-    Ok(response)
+        let image_bytes = fetch_image(url).await.unwrap();
+        let response = Response::builder()
+            .header("Content-Type", "image/jpeg")
+            .body(Body::from(image_bytes))
+            .unwrap();
+
+        Ok(response)
+    } else {
+        let response = Response::new(Body::from(url));
+        Ok(response)
+    }
 }
 
 #[tokio::main]
