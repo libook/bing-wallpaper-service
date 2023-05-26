@@ -97,20 +97,24 @@ async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
         res["images"][0]["url"].as_str().unwrap().to_owned()
     );
 
+    let response_builder = Response::builder()
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Headers", "*")
+        .header("Access-Control-Allow-Method", "*");
+    let response;
+
     if received_query.get_image {
         // Get image data
 
         let image_bytes = fetch_image(url).await.unwrap();
-        let response = Response::builder()
+        response = response_builder
             .header("Content-Type", "image/jpeg")
             .body(Body::from(image_bytes))
             .unwrap();
-
-        Ok(response)
     } else {
-        let response = Response::new(Body::from(url));
-        Ok(response)
+        response = response_builder.body(Body::from(url)).unwrap();
     }
+    Ok(response)
 }
 
 #[tokio::main]
