@@ -10,7 +10,7 @@ use bytes::Bytes;
 static BING_DOMAIN: &str = "https://www.bing.com";
 static BING_API_PATH: &str = "/HPImageArchive.aspx";
 // static BING_API_QUERYSTRING: &str = "format=js&idx=0&n=1&mkt=en-US";
-static LISTEN_ADDRESS: &str = "127.0.0.1:3000";
+static LISTEN_ADDRESS: &str = "0.0.0.0:3000";
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
