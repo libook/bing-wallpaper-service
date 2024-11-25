@@ -1,23 +1,26 @@
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
+use http_body_util::Full;
+use hyper::service::{service_fn};
+use hyper::server::conn::http1;
+use hyper::{Request, Response};
+use hyper_util::rt::tokio::TokioIo;
 use reqwest;
 use serde_derive::{Deserialize, Serialize};
 use serde_json;
 use serde_qs as qs;
 use std::convert::Infallible;
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
+
 use bytes::Bytes;
 
 static BING_DOMAIN: &str = "https://www.bing.com";
-static BING_API_PATH: &str = "/HPImageArchive.aspx";
-// static BING_API_QUERYSTRING: &str = "format=js&idx=0&n=1&mkt=en-US";
+static BING_API_PATH: &str = "/hp/api/model";
 static LISTEN_ADDRESS: &str = "0.0.0.0:3000";
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 struct RequestQueryParams {
     index_past: usize,
-    number: usize,
-    locale: String,
     get_image: bool,
 }
 
@@ -25,39 +28,16 @@ impl Default for RequestQueryParams {
     fn default() -> Self {
         RequestQueryParams {
             index_past: 0,
-            number: 1,
-            locale: "en-US".to_string(),
             get_image: false,
         }
     }
 }
 
-#[derive(Debug, PartialEq, Deserialize, Serialize)]
-#[serde(default)]
-struct BingQueryParams {
-    format: String,
-    idx: usize,
-    n: usize,
-    mkt: String,
-}
-
-impl Default for BingQueryParams {
-    fn default() -> Self {
-        BingQueryParams {
-            format: "js".to_string(),
-            idx: 0,
-            n: 1,
-            mkt: "en-US".to_string(),
-        }
-    }
-}
-
-async fn request_bing(bing_query: BingQueryParams) -> Result<serde_json::Value, Infallible> {
+async fn request_bing() -> Result<serde_json::Value, Infallible> {
     let res_raw = reqwest::get(format!(
-        "{}{}?{}",
+        "{}{}",
         BING_DOMAIN,
         BING_API_PATH,
-        serde_qs::to_string(&bing_query).unwrap(),
     )).await.unwrap();
 
     let res: serde_json::Value = res_raw.json().await.unwrap();
@@ -71,31 +51,18 @@ async fn fetch_image(url: String) -> Result<Bytes, Infallible> {
     Ok(bytes)
 }
 
-async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+async fn handle(req: Request<impl hyper::body::Body>) -> Result<Response<Full<Bytes>>, Infallible> {
     // Processing request arguments
 
     let received_querystring: &str = req.uri().query().unwrap_or("");
     let received_query: RequestQueryParams = qs::from_str(received_querystring).unwrap();
 
-    let mut bing_query = BingQueryParams {
-        ..Default::default()
-    };
-
-    {
-        bing_query.idx = received_query.index_past;
-        bing_query.n = received_query.number;
-        bing_query.mkt = received_query.locale;
-    }
-
     // Get image URL
 
-    let res = request_bing(bing_query).await.unwrap();
+    let res = request_bing().await.unwrap();
 
-    let url = format!(
-        "{}{}",
-        BING_DOMAIN,
-        res["images"][0]["url"].as_str().unwrap().to_owned()
-    );
+    let path = res["MediaContents"][received_query.index_past]["ImageContent"]["Image"]["Url"].as_str().unwrap().to_owned();
+    let url = format!("{}{}", BING_DOMAIN, path);
 
     let response_builder = Response::builder()
         .header("Access-Control-Allow-Origin", "*")
@@ -108,28 +75,39 @@ async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
 
         let image_bytes = fetch_image(url).await.unwrap();
         response = response_builder
-            .header("Content-Type", "image/jpeg")
-            .body(Body::from(image_bytes))
+            .header("Content-Type", "image/webp")
+            .body(Full::new(image_bytes))
             .unwrap();
     } else {
-        response = response_builder.body(Body::from(url)).unwrap();
+        response = response_builder.body(Full::new(Bytes::from(url))).unwrap();
     }
     Ok(response)
 }
 
 #[tokio::main]
-async fn main() {
-    let addr = LISTEN_ADDRESS.parse().unwrap();
-    let make_service = make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(handle)) });
-    let server = Server::bind(&addr).serve(make_service);
-    {
-        let bound_addr = server.local_addr();
-        tokio::spawn(async move {
-            println!("Server started at http://{}", bound_addr.to_string());
-            // do other things here
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr:SocketAddr = LISTEN_ADDRESS.parse().unwrap();
+    
+    // Bind prot and listen
+    let listener = TcpListener::bind(addr).await?;
+    println!("Listening on http://{}", addr);
+    
+    loop {
+        // Accept TCP connection
+        let (tcp, _) = listener.accept().await?;
+        
+        // Convert TcpStream to type hyper need
+        let io = TokioIo::new(tcp);
+
+        // Process the connection in a new task
+        tokio::task::spawn(async move {
+            // Use HTTP/1 process connection and bring request to handle function
+            if let Err(err) = http1::Builder::new()
+                .serve_connection(io, service_fn(handle))
+                .await
+            {
+                eprintln!("Error serving connection: {:?}", err);
+            }
         });
-    }
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
     }
 }

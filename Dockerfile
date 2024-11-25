@@ -1,11 +1,13 @@
 # Use Rust official image as builder
 FROM rustlang/rust:nightly-bullseye-slim as builder
 WORKDIR /
-# Copy Cargo files and compile dependencies
-COPY . ./
+
 RUN apt-get update
 RUN apt-get -y install pkg-config libssl-dev
 RUN rustup update
+
+# Copy Cargo files and compile dependencies
+COPY . ./
 RUN cargo build --release
 
 FROM debian:bullseye-slim

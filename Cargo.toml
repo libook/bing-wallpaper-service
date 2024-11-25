@@ -1,17 +1,19 @@
 [package]
 name = "bing-wallpaper-service"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bytes = "1.4.0"
-hyper = { version = "0.14", features = ["server"] }
-reqwest = { version = "0.11.18", features = [ "json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_derive = "1.0.163"
-serde_json = "1.0.96"
-serde_qs = "0.12.0"
-tokio = { version = "1", features = ["macros","rt-multi-thread"] }
-url = "2.3.1"
+bytes = "1.8.0"
+http-body-util = "0.1.2"
+hyper = { version = "1.5.1", features = ["server"] }
+hyper-util = "0.1.10"
+reqwest = { version = "0.12.9", features = [ "json"] }
+serde = { version = "1.0.215", features = ["derive"] }
+serde_derive = "1.0.215"
+serde_json = "1.0.133"
+serde_qs = "0.13.0"
+tokio = { version = "1.41.1", features = ["macros","rt-multi-thread"] }
+url = "2.5.3"
