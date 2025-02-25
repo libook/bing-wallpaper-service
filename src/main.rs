@@ -1,6 +1,6 @@
 use http_body_util::Full;
-use hyper::service::{service_fn};
 use hyper::server::conn::http1;
+use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::tokio::TokioIo;
 use reqwest;
@@ -38,7 +38,9 @@ async fn request_bing() -> Result<serde_json::Value, Infallible> {
         "{}{}",
         BING_DOMAIN,
         BING_API_PATH,
-    )).await.unwrap();
+    ))
+        .await
+        .unwrap();
 
     let res: serde_json::Value = res_raw.json().await.unwrap();
 
@@ -61,7 +63,10 @@ async fn handle(req: Request<impl hyper::body::Body>) -> Result<Response<Full<By
 
     let res = request_bing().await.unwrap();
 
-    let path = res["MediaContents"][received_query.index_past]["ImageContent"]["Image"]["Url"].as_str().unwrap().to_owned();
+    let path = res["MediaContents"][received_query.index_past]["ImageContent"]["Image"]["Url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     println!("Got image path: {}", path);
     // If no origin in path, use BING_DOMAIN.
     let url = if !path.contains("http") {
@@ -92,16 +97,16 @@ async fn handle(req: Request<impl hyper::body::Body>) -> Result<Response<Full<By
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let addr:SocketAddr = LISTEN_ADDRESS.parse().unwrap();
-    
+    let addr: SocketAddr = LISTEN_ADDRESS.parse().unwrap();
+
     // Bind prot and listen
     let listener = TcpListener::bind(addr).await?;
     println!("Listening on http://{}", addr);
-    
+
     loop {
         // Accept TCP connection
         let (tcp, _) = listener.accept().await?;
-        
+
         // Convert TcpStream to type hyper need
         let io = TokioIo::new(tcp);
 
