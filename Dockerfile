@@ -1,5 +1,5 @@
 # Use Rust official image as builder
-FROM rustlang/rust:nightly-bullseye-slim as builder
+FROM rustlang/rust:nightly-bullseye-slim AS builder
 WORKDIR /
 
 RUN apt-get update
