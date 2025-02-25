@@ -62,7 +62,13 @@ async fn handle(req: Request<impl hyper::body::Body>) -> Result<Response<Full<By
     let res = request_bing().await.unwrap();
 
     let path = res["MediaContents"][received_query.index_past]["ImageContent"]["Image"]["Url"].as_str().unwrap().to_owned();
-    let url = format!("{}{}", BING_DOMAIN, path);
+    println!("Got image path: {}", path);
+    // If no origin in path, use BING_DOMAIN.
+    let url = if !path.contains("http") {
+        format!("{}{}", BING_DOMAIN, path)
+    } else {
+        path
+    };
 
     let response_builder = Response::builder()
         .header("Access-Control-Allow-Origin", "*")
