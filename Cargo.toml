@@ -10,10 +10,10 @@ bytes = "1.8.0"
 http-body-util = "0.1.2"
 hyper = { version = "1.5.1", features = ["server"] }
 hyper-util = "0.1.10"
-reqwest = { version = "0.12.9", features = [ "json"] }
+reqwest = { version = "0.13", features = [ "json"] }
 serde = { version = "1.0.215", features = ["derive"] }
 serde_derive = "1.0.215"
 serde_json = "1.0.133"
-serde_qs = "0.13.0"
+serde_qs = "1.0"
 tokio = { version = "1.41.1", features = ["macros","rt-multi-thread"] }
 url = "2.5.3"
