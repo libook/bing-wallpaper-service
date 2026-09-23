@@ -6,15 +6,15 @@ use hyper_util::rt::tokio::TokioIo;
 use reqwest;
 use serde_derive::{Deserialize, Serialize};
 use serde_qs as qs;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-
-#[cfg(test)]
-use std::collections::HashMap;
+use tokio::sync::Mutex as AsyncMutex;
 
 use bytes::Bytes;
 
@@ -46,7 +46,7 @@ impl Default for RequestQueryParams {
 /// upstream contract, the upstream being unreachable, an image host being
 /// unreachable, or the requested index not existing. The handler adapter
 /// translates these to HTTP responses; the module does not know HTTP.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum SourceError {
     Parse(String),
     Network(String),
@@ -77,7 +77,7 @@ trait Http: Send + Sync {
 
 /// Error mode of the HTTP layer, distinct from the source's own errors so the
 /// module can translate rather than leak it across the seam.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum HttpError {
     Network(String),
 }
@@ -177,11 +177,12 @@ struct Image {
 /// injected through the `Http` seam rather than created inside.
 struct BingWallpaperSource {
     http: Arc<dyn Http>,
+    image_cache: Arc<ImageCache>,
 }
 
 impl BingWallpaperSource {
-    fn new(http: Arc<dyn Http>) -> Self {
-        Self { http }
+    fn new(http: Arc<dyn Http>, image_cache: Arc<ImageCache>) -> Self {
+        Self { http, image_cache }
     }
 
     async fn request_bing(&self) -> Result<BingResponse, SourceError> {
@@ -195,11 +196,24 @@ impl BingWallpaperSource {
         serde_json::from_slice(&bytes).map_err(|e| SourceError::Parse(e.to_string()))
     }
 
-    async fn fetch_image(&self, url: String) -> Result<Bytes, SourceError> {
+    async fn fetch_image(&self, url: &str) -> Result<Bytes, SourceError> {
         self.http
-            .get(&url)
+            .get(url)
             .await
             .map_err(|e| SourceError::ImageFetch(e.to_string()))
+    }
+
+    /// Download the image at `url`, or serve it from the in-memory cache when
+    /// its 24h window is still fresh. The cache is keyed by URL, so it covers
+    /// historical wallpapers too and is independent of how the client asked
+    /// for it.
+    async fn cached_image(&self, url: &str) -> Result<Bytes, SourceError> {
+        let url = url.to_string();
+        self.image_cache
+            .get(&url.clone(), move || {
+                Box::pin(async move { self.fetch_image(&url).await })
+            })
+            .await
     }
 
     async fn wallpaper_url(&self, index_past: usize) -> Result<String, SourceError> {
@@ -219,6 +233,133 @@ impl BingWallpaperSource {
         } else {
             Ok(path.clone())
         }
+    }
+}
+
+// --- In-memory image cache ---
+
+/// How long a cached image blob counts as fresh before it must be
+/// re-downloaded from Bing's image host.
+const IMAGE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A downloaded image blob and the moment it stops being fresh.
+struct CachedImage {
+    bytes: Bytes,
+    expires_at: Instant,
+}
+
+/// The cached state guarded by a plain `Mutex`. The outer lock is never held
+/// across an await: it only glances at the tables and reserves a per-URL slot.
+struct ImageCacheInner {
+    entries: HashMap<String, CachedImage>,
+    in_flight: HashMap<String, Arc<AsyncMutex<Option<CacheResult>>>>,
+}
+
+/// Thread-safe in-memory cache of downloaded image bytes, keyed by the
+/// resolved image URL.
+///
+/// The key is the URL, never the client's request parameters. `index_past` is a
+/// relative position that Bing advances by one every day, so keying on it would
+/// leave a stale entry behind each time the feed rotates; a URL is the stable
+/// identity of a wallpaper.
+///
+/// The TTL is a sliding 24h window: a hit reseeds the timer from the moment of
+/// the hit, so a picture that keeps getting requested never expires. Failures
+/// are deliberately not cached, so an expired or failed picture is downloaded
+/// again on the next request instead of being served a stale error.
+struct ImageCache {
+    inner: Mutex<ImageCacheInner>,
+}
+
+/// The result of downloading one image: exactly what
+/// [`BingWallpaperSource::fetch_image`] produces, so the cache can store and
+/// hand it out to coalesced callers unchanged.
+type CacheResult = Result<Bytes, SourceError>;
+
+impl ImageCache {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(ImageCacheInner {
+                entries: HashMap::new(),
+                in_flight: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Return the bytes for `url`, downloading them through `fetch` on a miss.
+    ///
+    /// Concurrent callers for the same URL coalesce onto a single upstream
+    /// fetch: the first caller to reach the cache runs `fetch` while the rest
+    /// wait on the same per-URL slot and receive its result.
+    #[allow(clippy::needless_lifetimes)]
+    async fn get<'a, F>(&'a self, url: &str, fetch: F) -> CacheResult
+    where
+        // The fetch future is tied to the cache borrow: it may only be polled
+        // while the caller still holds the cache, so it cannot outlive it.
+        F: FnOnce() -> Pin<Box<dyn Future<Output = CacheResult> + Send + 'a>>,
+    {
+        // 1. Reserve a per-URL slot, after checking for a fresh cached blob.
+        //    Everything here is under the outer lock, which is dropped before
+        //    any await, so this is a short critical section.
+        let slot: Arc<AsyncMutex<Option<CacheResult>>> = {
+            let mut inner = self.inner.lock().unwrap();
+            let now = Instant::now();
+
+            let expired = if let Some(entry) = inner.entries.get_mut(url) {
+                if entry.expires_at > now {
+                    // Cache hit: slide the window from this moment.
+                    entry.expires_at = now + IMAGE_CACHE_TTL;
+                    return Ok(entry.bytes.clone());
+                }
+                true
+            } else {
+                false
+            };
+            // The mutable borrow of `entry` ends here, so the table can be
+            // mutated again to drop the stale blob.
+            if expired {
+                inner.entries.remove(url);
+            }
+
+            if let Some(slot) = inner.in_flight.get(url) {
+                Arc::clone(slot)
+            } else {
+                let slot = Arc::new(AsyncMutex::new(None));
+                inner.in_flight.insert(url.to_string(), Arc::clone(&slot));
+                slot
+            }
+        };
+
+        // 2. Serialize on the per-URL slot. The first task sees `None` and
+        //    fetches; everyone else sees the stored result.
+        let mut guard = slot.lock().await;
+        if let Some(result) = &*guard {
+            return result.clone();
+        }
+
+        // 3. We are the fetcher. Run the download while holding the slot, so no
+        //    other caller can start a second fetch for the same URL.
+        let result = fetch().await;
+        *guard = Some(result.clone());
+        drop(guard);
+
+        // 4. Publish: remember the blob on success and drop the in-flight
+        //    marker. Failures are not cached, so the next request retries.
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.in_flight.remove(url);
+            if let Ok(bytes) = &result {
+                inner.entries.insert(
+                    url.to_string(),
+                    CachedImage {
+                        bytes: bytes.clone(),
+                        expires_at: Instant::now() + IMAGE_CACHE_TTL,
+                    },
+                );
+            }
+        }
+
+        result
     }
 }
 
@@ -277,9 +418,13 @@ async fn handle(
     let response;
 
     if received_query.get_image {
-        // Get image data
+        // Get image data. The in-memory cache keeps the last 24h of blobs per
+        // image URL (keyed by URL, not by the client's query), so historical
+        // wallpapers are cached too and repeated viewers do not re-download
+        // from Bing. The Bing API itself is intentionally not cached, so a
+        // request for index_past=0 still resolves to today's new wallpaper.
 
-        let image_bytes = match source.fetch_image(url).await {
+        let image_bytes = match source.cached_image(&url).await {
             Ok(bytes) => bytes,
             // Upstream image host unavailable: the service is up, the host is not.
             Err(err) => return Ok(error_response(502, &err.to_string())),
@@ -302,6 +447,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(addr).await?;
     println!("Listening on http://{}", addr);
 
+    // In-memory image cache shared by every connection task, so concurrent
+    // clients coalesce onto one download per image URL.
+    let image_cache = Arc::new(ImageCache::new());
+
     loop {
         // Accept TCP connection
         let (tcp, _) = listener.accept().await?;
@@ -310,8 +459,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let io = TokioIo::new(tcp);
 
         // Process the connection in a new task
+        let image_cache = Arc::clone(&image_cache);
         tokio::task::spawn(async move {
-            let source = BingWallpaperSource::new(Arc::new(ReqwestHttp));
+            let source = BingWallpaperSource::new(Arc::new(ReqwestHttp), image_cache);
 
             // Use HTTP/1 process connection and bring request to handle function
             if let Err(err) = http1::Builder::new()
@@ -326,15 +476,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle, BingWallpaperSource, MockHttp, Request, SourceError};
+    use super::{handle, BingWallpaperSource, Http, HttpError, ImageCache, MockHttp, Request, SourceError};
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn source_with(response: Bytes) -> BingWallpaperSource {
         let url = format!("{}{}", super::BING_DOMAIN, super::BING_API_PATH);
         let mock = MockHttp::new().with(&url, response);
-        BingWallpaperSource::new(Arc::new(mock))
+        BingWallpaperSource::new(Arc::new(mock), Arc::new(ImageCache::new()))
+    }
+
+    /// Test adapter that records which URLs were fetched and how many times,
+    /// so the cache's request-coalescing and freshness behaviour can be
+    /// asserted without touching the network.
+    #[cfg(test)]
+    #[derive(Default)]
+    struct CountingHttp {
+        responses: HashMap<String, Bytes>,
+        fetch_count: AtomicUsize,
+        fetched_urls: Mutex<Vec<String>>,
+    }
+
+    #[cfg(test)]
+    impl CountingHttp {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with(mut self, url: &str, bytes: Bytes) -> Self {
+            self.responses.insert(url.to_string(), bytes);
+            self
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.fetched_urls.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(test)]
+    impl Http for CountingHttp {
+        fn get(&self, url: &str) -> Pin<Box<dyn Future<Output = Result<Bytes, HttpError>> + Send>> {
+            let url = url.to_string();
+            let bytes = self.responses.get(&url).cloned();
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.fetched_urls.lock().unwrap().push(url.clone());
+            Box::pin(async move {
+                // A slow host so concurrent callers overlap in time.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                bytes.ok_or_else(|| HttpError::Network(format!("no mock response for {}", url)))
+            })
+        }
+    }
+
+    /// Build a counting mock whose Bing API response advertises `image_url` as
+    /// the (only) wallpaper, with `image` as its bytes.
+    fn counting_http(image_url: &str, image: Bytes) -> Arc<CountingHttp> {
+        let api_url = format!("{}{}", super::BING_DOMAIN, super::BING_API_PATH);
+        let json = format!(
+            r#"{{"MediaContents":[{{"ImageContent":{{"Image":{{"Url":"{}"}}}}}}]}}"#,
+            image_url
+        );
+        Arc::new(
+            CountingHttp::new()
+                .with(&api_url, Bytes::from(json))
+                .with(image_url, image),
+        )
+    }
+
+    fn source(image_url: &str, image: Bytes) -> (BingWallpaperSource, Arc<CountingHttp>) {
+        let counting = counting_http(image_url, image);
+        let source = BingWallpaperSource::new(counting.clone(), Arc::new(ImageCache::new()));
+        (source, counting)
     }
 
     #[tokio::test]
@@ -366,9 +584,9 @@ mod tests {
     async fn fetch_image_returns_bytes_from_mock() {
         let image = Bytes::from_static(b"IMAGE");
         let mock = MockHttp::new().with("https://example.com/img.webp", image.clone());
-        let source = BingWallpaperSource::new(Arc::new(mock));
+        let source = BingWallpaperSource::new(Arc::new(mock), Arc::new(ImageCache::new()));
         let bytes = source
-            .fetch_image("https://example.com/img.webp".to_string())
+            .fetch_image("https://example.com/img.webp")
             .await
             .unwrap();
         assert_eq!(bytes, image);
@@ -403,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn handle_returns_502_when_upstream_is_unreachable() {
         // Empty mock: no response for the Bing API URL → network failure.
-        let source = BingWallpaperSource::new(Arc::new(MockHttp::new()));
+        let source = BingWallpaperSource::new(Arc::new(MockHttp::new()), Arc::new(ImageCache::new()));
         let resp = handle(get_request("/?index_past=0"), &source)
             .await
             .unwrap();
@@ -425,7 +643,7 @@ mod tests {
         // Bing API responds 200 but with body that is not the expected JSON.
         let api_url = format!("{}{}", super::BING_DOMAIN, super::BING_API_PATH);
         let mock = MockHttp::new().with(&api_url, Bytes::from_static(b"not json"));
-        let source = BingWallpaperSource::new(Arc::new(mock));
+        let source = BingWallpaperSource::new(Arc::new(mock), Arc::new(ImageCache::new()));
         let resp = handle(get_request("/?index_past=0"), &source)
             .await
             .unwrap();
@@ -440,7 +658,7 @@ mod tests {
         let mock = MockHttp::new()
             .with(&api_url, Bytes::from(json.as_bytes()))
             .with("https://example.com/img.webp", image.clone());
-        let source = BingWallpaperSource::new(Arc::new(mock));
+        let source = BingWallpaperSource::new(Arc::new(mock), Arc::new(ImageCache::new()));
 
         let resp = handle(get_request("/?index_past=0&get_image=true"), &source)
             .await
@@ -457,10 +675,138 @@ mod tests {
         let api_url = format!("{}{}", super::BING_DOMAIN, super::BING_API_PATH);
         let json = r#"{"MediaContents":[{"ImageContent":{"Image":{"Url":"https://example.com/img.webp"}}}]}"#;
         let mock = MockHttp::new().with(&api_url, Bytes::from(json.as_bytes()));
-        let source = BingWallpaperSource::new(Arc::new(mock));
+        let source = BingWallpaperSource::new(Arc::new(mock), Arc::new(ImageCache::new()));
         let resp = handle(get_request("/?index_past=0&get_image=true"), &source)
             .await
             .unwrap();
         assert_eq!(resp.status(), 502);
+    }
+
+    // --- Image cache behaviour ---
+
+    #[tokio::test]
+    async fn cached_image_serves_cached_bytes_and_slides_ttl() {
+        let (source, counting) = source("https://example.com/img.webp", Bytes::from_static(b"IMG"));
+
+        let first = source.cached_image("https://example.com/img.webp").await.unwrap();
+        assert_eq!(first, Bytes::from_static(b"IMG"));
+        assert_eq!(counting.fetch_count.load(Ordering::SeqCst), 1);
+
+        let expires_before = source
+            .image_cache
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .get("https://example.com/img.webp")
+            .unwrap()
+            .expires_at;
+
+        // Enough distance that a reseeded window is observably later.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let second = source.cached_image("https://example.com/img.webp").await.unwrap();
+        assert_eq!(second, Bytes::from_static(b"IMG"));
+        // Cache hit: no second upstream fetch.
+        assert_eq!(counting.fetch_count.load(Ordering::SeqCst), 1);
+
+        let expires_after = source
+            .image_cache
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .get("https://example.com/img.webp")
+            .unwrap()
+            .expires_at;
+        assert!(expires_after > expires_before, "TTL should slide forward on hit");
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_for_same_url_fetch_once() {
+        let image = Bytes::from_static(b"IMG");
+        let counting = counting_http("https://example.com/img.webp", image.clone());
+        // All callers must share one cache for coalescing to happen.
+        let shared_cache = Arc::new(ImageCache::new());
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(5));
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let http: Arc<dyn Http> = counting.clone();
+            let source = BingWallpaperSource::new(http, Arc::clone(&shared_cache));
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                source.cached_image("https://example.com/img.webp").await
+            }));
+        }
+        for h in handles {
+            let bytes = h.await.unwrap().unwrap();
+            assert_eq!(bytes, image);
+        }
+        // Single flight: exactly one upstream fetch despite five concurrent callers.
+        assert_eq!(counting.fetch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(counting.calls(), vec!["https://example.com/img.webp".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn expired_entry_is_fetched_again() {
+        let image = Bytes::from_static(b"IMG");
+        let counting = counting_http("https://example.com/img.webp", image.clone());
+        let cache = Arc::new(ImageCache::new());
+        let source = BingWallpaperSource::new(counting.clone(), Arc::clone(&cache));
+
+        source.cached_image("https://example.com/img.webp").await.unwrap();
+        assert_eq!(counting.fetch_count.load(Ordering::SeqCst), 1);
+
+        // Force the entry to expire.
+        cache
+            .inner
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("https://example.com/img.webp")
+            .unwrap()
+            .expires_at = Instant::now() - Duration::from_secs(1);
+
+        source.cached_image("https://example.com/img.webp").await.unwrap();
+        assert_eq!(counting.fetch_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_error_is_not_cached() {
+        // No image response: the image host is unreachable.
+        let api_url = format!("{}{}", super::BING_DOMAIN, super::BING_API_PATH);
+        let json = r#"{"MediaContents":[{"ImageContent":{"Image":{"Url":"https://example.com/img.webp"}}}]}"#;
+        let counting = Arc::new(CountingHttp::new().with(&api_url, Bytes::from(json.as_bytes())));
+        let cache = Arc::new(ImageCache::new());
+        let source = BingWallpaperSource::new(counting.clone(), Arc::clone(&cache));
+
+        let err = source.cached_image("https://example.com/img.webp").await.unwrap_err();
+        assert!(matches!(err, SourceError::ImageFetch(_)));
+        assert_eq!(counting.fetch_count.load(Ordering::SeqCst), 1);
+
+        // A second request must re-fetch rather than serving a cached failure.
+        source.cached_image("https://example.com/img.webp").await.unwrap_err();
+        assert_eq!(counting.fetch_count.load(Ordering::SeqCst), 2);
+        assert!(cache.inner.lock().unwrap().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn url_only_request_does_not_populate_image_cache() {
+        let image = Bytes::from_static(b"IMG");
+        let counting = counting_http("https://example.com/img.webp", image.clone());
+        let cache = Arc::new(ImageCache::new());
+        let source = BingWallpaperSource::new(counting.clone(), Arc::clone(&cache));
+
+        let resp = handle(get_request("/?index_past=0"), &source).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // The URL path never downloads the image, so the cache stays empty and
+        // the image host was never contacted.
+        assert!(cache.inner.lock().unwrap().entries.is_empty());
+        assert!(cache.inner.lock().unwrap().in_flight.is_empty());
+        assert_eq!(counting.fetch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(counting.calls(), vec![format!("{}{}", super::BING_DOMAIN, super::BING_API_PATH)]);
     }
 }
