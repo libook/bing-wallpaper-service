@@ -1,5 +1,5 @@
 # Use Rust official image as builder
-FROM rustlang/rust:nightly-bullseye-slim AS builder
+FROM rustlang/rust:nightly-trixie-slim AS builder
 WORKDIR /
 
 RUN apt-get update
@@ -10,7 +10,7 @@ RUN rustup update
 COPY . ./
 RUN cargo build --release
 
-FROM debian:bullseye-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install --no-install-recommends -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
